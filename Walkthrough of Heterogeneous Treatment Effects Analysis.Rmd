@@ -1,0 +1,1469 @@
+---
+title: "Walkthrough of Heterogeneous Treatment Effects Analysis"
+author: "Thomas Jemielita"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    highlight: "textmate"
+    css: "custom.css"
+bibliography: references.bib
+link-citations: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 7
+)
+```
+
+# Overview
+
+This document demonstrates the complete workflow for identifying heterogeneous treatment effects, including estimating conditional average treatment effects (CATEs), identifying subgroups, and subgroup-specific treatment estimation. The `benchtm` package ([Sophie-Sun/benchtm](https://github.com/Sophie-Sun/benchtm)) is used for simulations. The following models/methods were then applied:
+
+1. **CATE Estimation Methods**:
+   - S-Learner (single-model approach via random forest)
+   - T-Learner (two-model approach via random forest)
+   - X-Learner (Künzel et al., 2019 — cross-arm imputation meta-learner)
+   - Causal Forest (`grf` package)
+
+2. **Subgroup Identification Methods**:
+   - Virtual Twins (RF-based CATE + regression tree)
+   - Model-Based Recursive Partitioning (MOB)
+   - `personalized` package (linear regression learner — model-based subgroup rule)
+   
+Each method then assigns patients into "Benefitting" (B) (subgroup-level treatment estimate > 0) or "Non-Benefitting" (NB) (treatment estimate ≤ 0) groups, such that the identified subgroups are $S={S_{B}, S_{NB}}$. Here, the goal is to identify which group(s) of patients potentially benefit or do not benefit from the experimental treatment. 
+
+3. **Subgroup-Level Treatment Effect Estimation**:
+   - Naive (Empirical): Unadjusted difference-in-means within each subgroup: `lm(Y ~ trt)` restricted to each subgroup.
+   - Bootstrap (Refit): Uses bootstrap resampling to estimate 95% CIs and/or bias for the subgroup-specific treatment estimates. This involves running the full subgroup identification / estimation process for each bootstrap resample and accounts for variability in both CATE estimation and subgroup identification.
+   - Debiased Bootstrap [@guo2021inference; @zhao2023inference]: Bootstrap based approach with bias-correction that takes into account the selection process. However, this does not require repeating the entire identification process for each bootstrap resample.
+
+## Simulation Design
+
+| Feature | Specification |
+|:--------|:-------------|
+| Sample size | N = 400 (1:1 randomization) |
+| Treatment | Binary (trt = 0 or 1) |
+| Outcome | Continuous |
+| Covariates | 20 total |
+| Predictive (effect modifiers) | 3 variables (X3, X4, X7) |
+| Prognostic only | 7 variables (X1, X2, X5, X6, X8, X9, X10) |
+| Noise | 10 variables (X11–X20) |
+
+
+# Setup and Packages
+
+```{r packages}
+# Install benchtm if needed:
+# devtools::install_github("Sophie-Sun/benchtm")
+library(benchtm)
+library(ranger)
+library(grf)
+library(partykit)
+library(rpart)
+library(rpart.plot)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+library(personalized)
+library(boot)
+library(glmnet)
+
+set.seed(2026)
+```
+
+
+# Data Generation with `benchtm`
+
+We use `benchtm::generate_X_dist()` to create 20 covariates (a mix of binary, exponential, correlated normal, multinomial, and independent normal variables), then `generate_trt()` for 1:1 randomized treatment, and `generate_y()` to create a continuous outcome.
+
+The data-generating model is:
+
+$$
+Y = f_{\text{prog}}(X) + \text{trt} \cdot \left(\beta_0 + \beta_1 \cdot f_{\text{pred}}(X)\right) + \varepsilon, \quad \varepsilon \sim N(0, \sigma)
+$$
+
+- Prognostic function: $f_{\text{prog}}(X) = 0.5 \cdot X3 + 0.3 \cdot X8 + 0.2 \cdot X9 + 0.4 \cdot X10 + 0.3 \cdot X2 + 0.2 \cdot (X1 == \text{"Y"})$
+  - Uses 7 variables overall contributing to outcome on control
+- Predictive function: $f_{\text{pred}}(X) = X3 + 0.5 \cdot X4 + 0.3 \cdot X7$
+  - The 3 true effect modifiers
+- Treatment effect: $\text{CATE}(X) = \beta_0 + \beta_1 \cdot (X3 + 0.5 \cdot X4 + 0.3 \cdot X7)$
+
+```{r data-generation}
+N <- 400
+p <- 20
+
+# Generate covariates (benchtm creates X1-X20 with mixed types)
+X <- generate_X_dist(n = N, p = p, rho = 0.5)
+
+# 1:1 randomized treatment
+trt <- generate_trt(n = N, p_trt = 0.5)
+
+# Define prognostic and predictive expressions
+# Prognostic: uses X1 (binary), X2 (exp), X3, X5, X6, X8, X9, X10
+prog_expr <- "0.5*X3 + 0.3*X8 + 0.2*X9 + 0.4*X10 + 0.3*X2 + 0.2*(X1=='Y')"
+
+# Predictive: X3, X4, X7 are the true effect modifiers
+pred_expr <- "X3 + 0.5*X4 + 0.3*X7"
+
+# Generate outcome
+# b0 = 1 (overall treatment effect), b1 = 2 (interaction strength)
+dat <- generate_y(
+  X = X, trt = trt,
+  prog = prog_expr,
+  pred = pred_expr,
+  b0 = 1, b1 = 2,
+  type = "continuous",
+  sigma_error = 1.5,
+  include_truth = TRUE
+)
+
+# Quick summary
+out <- c(
+  paste("Dimensions:", nrow(dat), "x", ncol(dat)),
+  paste("Treatment allocation:", paste(names(table(dat$trt)), table(dat$trt), collapse = ", ")),
+  paste("DGP formula:", attr(dat, "form"))
+)
+cat(paste(out, collapse = "\n"), "\n")
+```
+
+```{r inspect-data}
+# Inspect the data and true treatment effects
+out <- c(capture.output(print(head(dat[, c("trt", "Y", "trt_effect", "X3", "X4", "X7")]))),
+         "",
+         "True CATE summary:",
+         capture.output(print(summary(dat$trt_effect))))
+cat(paste(out, collapse = "\n"), "\n")
+```
+
+## Visualize True CATEs
+
+```{r plot-true-cate, fig.height=5}
+ggplot(dat, aes(x = trt_effect)) +
+  geom_histogram(bins = 40, fill = "grey30", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Distribution of True CATEs",
+    x = "True CATE",
+    y = "Count",
+    caption = "CATE = b0 + b1 * (X3 + 0.5*X4 + 0.3*X7); b0=1, b1=2, sigma=1.5"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid = element_blank())
+```
+
+```{r true-cate-vs-predictive, fig.height=5}
+# True CATE vs. the three predictive variables
+p1 <- ggplot(dat, aes(x = X3, y = trt_effect)) + 
+  geom_point(alpha = 0.4, size = 1) + geom_smooth(method = "loess", se = FALSE) +
+  labs(y = "True CATE") + theme_bw() + theme(panel.grid = element_blank())
+p2 <- ggplot(dat, aes(x = X4, y = trt_effect)) + 
+  geom_point(alpha = 0.4, size = 1) + geom_smooth(method = "loess", se = FALSE) +
+  labs(y = "True CATE") + theme_bw() + theme(panel.grid = element_blank())
+p3 <- ggplot(dat, aes(x = X7, y = trt_effect)) + 
+  geom_point(alpha = 0.4, size = 1) + geom_smooth(method = "loess", se = FALSE) +
+  labs(y = "True CATE") + theme_bw() + theme(panel.grid = element_blank())
+
+p1 + p2 + p3 + plot_annotation(title = "True CATE vs. Predictive Covariates")
+```
+
+
+# Prepare Model Data
+
+```{r prepare-model-data}
+# Prepare covariate matrix (convert factors to numeric for RF/grf)
+X_covs <- dat %>% select(starts_with("X"))
+X_covs <- data.frame(X_covs)
+
+# Numeric model matrix for methods that need it (grf, glmnet, personalized)
+# model.matrix expands factors to dummy columns
+X_mat <- model.matrix(~ . - 1, data = X_covs)
+
+Y <- dat$Y
+Trt <- dat$trt          # Note: we use 'Trt' (not 'T') to avoid masking base R's TRUE
+true_cate <- dat$trt_effect
+```
+
+
+# Covariate Screening or Filtering
+
+Before applying CATE estimation and subgroup methods, it is often useful to screen covariates to distinguish variables that are potentially prognostic (those that affect the outcome regardless of the treatment) and/or predictive (those that modify the treatment effect). This step can reduce dimensionality and guide the choice of covariates for downstream methods.
+
+Here, the elastic net model (Zou & Hastie, 2005) with mixing parameter $\alpha = 0.5$ (a compromise between ridge and lasso) is used:
+
+$$
+Y = X\beta_{\text{prog}} + \text{Trt} \cdot \beta_T + X \cdot \text{Trt} \cdot \beta_{\text{pred}} + \varepsilon
+$$
+
+where:
+
+- $\beta_{\text{prog}}$ captures prognostic effects (main effects of covariates on outcome)
+- $\beta_T$ captures the overall treatment effect
+- $\beta_{\text{pred}}$ captures predictive effects (treatment–covariate interactions, i.e., effect modifiers)
+
+The elastic net penalty shrinks irrelevant coefficients to zero, providing a data-driven variable selection and can highlight which covariates are potentially prognostic ($\beta_{\text{prog}}$) and/or predictive (via $\beta_{\text{pred}}$).
+
+```{r elastic-net-screening}
+# Build design matrix with main effects, treatment main effect, and X × Trt interactions
+# X_mat (from prepare-model-data) already expands factors to dummy columns
+X_trt_interact <- X_mat * Trt  # element-wise: each column of X multiplied by Trt
+colnames(X_trt_interact) <- paste0(colnames(X_mat), ":Trt")
+
+# Full design matrix: [X main effects | Trt | X:Trt interactions]
+X_full <- cbind(X_mat, Trt = Trt, X_trt_interact)
+
+# Fit elastic net (alpha = 0.5) with cross-validation
+set.seed(2026)
+enet_fit <- cv.glmnet(X_full, Y, family = "gaussian", alpha = 0.5, nfolds = 10)
+
+# Extract coefficients at lambda.1se (more parsimonious than lambda.min)
+enet_coefs <- coef(enet_fit, s = "lambda.1se")
+coef_df <- data.frame(
+  variable = rownames(enet_coefs),
+  coefficient = as.numeric(enet_coefs)
+) %>%
+  filter(variable != "(Intercept)", coefficient != 0)
+
+out <- c("Non-zero elastic net coefficients (lambda.1se):",
+         capture.output(print(coef_df)),
+         "",
+         paste0("lambda.min: ", round(enet_fit$lambda.min, 4),
+                "  lambda.1se: ", round(enet_fit$lambda.1se, 4)))
+cat(paste(out, collapse = "\n"), "\n")
+```
+
+```{r enet-classify-coefficients}
+# Classify each coefficient as prognostic (main effect) or predictive (interaction)
+coef_df <- coef_df %>%
+  mutate(
+    type = ifelse(grepl(":Trt$", variable), "Predictive (X × Trt)", "Prognostic (Main)"),
+    # Strip the :Trt suffix for matching
+    base_var = gsub(":Trt$", "", variable),
+    # Remove factor level suffixes to get original variable name
+    orig_var = gsub("(Y|N|M[1-4])$", "", base_var)
+  ) %>%
+  filter(variable != "Trt")  # exclude the overall Trt main effect from the table
+
+# Summary table: which variables are prognostic vs predictive
+var_summary <- coef_df %>%
+  group_by(orig_var) %>%
+  summarise(
+    prognostic_coef = sum(coefficient[type == "Prognostic (Main)"], na.rm = TRUE),
+    predictive_coef = sum(coefficient[type == "Predictive (X × Trt)"], na.rm = TRUE),
+    role = case_when(
+      any(type == "Predictive (X × Trt)") & any(type == "Prognostic (Main)") ~ "Both",
+      any(type == "Predictive (X × Trt)") ~ "Predictive",
+      TRUE ~ "Prognostic"
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(abs(predictive_coef)))
+
+knitr::kable(var_summary, digits = 3,
+             col.names = c("Variable", "Prognostic β", "Predictive β", "Role"),
+             caption = "Elastic Net Variable Classification: Prognostic vs. Predictive")
+
+# Store selected variable names and counts for downstream use
+selected_vars_enet <- unique(coef_df$orig_var)
+n_selected_enet <- length(selected_vars_enet)
+n_predictive_enet <- sum(var_summary$role %in% c("Predictive", "Both"))
+n_prognostic_enet <- sum(var_summary$role %in% c("Prognostic", "Both"))
+predictive_vars_enet <- var_summary$orig_var[var_summary$role %in% c("Predictive", "Both")]
+```
+
+```{r enet-coefficient-plot, fig.height=6, fig.width=9}
+# Coefficient plot: prognostic vs predictive effects side by side
+if (nrow(coef_df) > 0) {
+  ggplot(coef_df, aes(x = reorder(base_var, abs(coefficient)), y = coefficient, fill = type)) +
+    geom_col(position = "dodge", width = 0.7) +
+    coord_flip() +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    scale_fill_manual(values = c("Prognostic (Main)" = "#377EB8", "Predictive (X × Trt)" = "#E41A1C")) +
+    labs(
+      title = "Elastic Net Coefficients: Prognostic vs. Predictive",
+      subtitle = paste0("alpha = 0.5, lambda.1se = ", round(enet_fit$lambda.1se, 4),
+                        " | True predictive: X3, X4, X7"),
+      x = NULL, y = "Coefficient",
+      fill = "Effect Type"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "top"
+    )
+}
+```
+
+
+Overall, these results show that X3, X4, and X7 are likely predictive which is consistent with the true generating model. However, note that other truly non-predictive variables also get flagged as potentially predictive (e.g. X5=Y patients). Either way, if the decision was to take all covariates with non-zero coefficients (prognostic or predictive), this screening step would yield a total of `r n_selected_enet` candidate covariates for downstream analyses. 
+
+In practice, the candidate set of covariates for heterogeneous treatment effect analyses is a crucial step and should by guided by prior data, domain expertise, biological plausibility, and practical implementation (e.g. can you use this factor to select patients?). Pre-specification of the candidate set in the Staistical Analysis Plan (SAP) can also increase credibility of any downstream result. For simplicity, the CATE and subgroup methods below will use the full set of 20 covariates.
+
+
+# CATE Estimation
+
+Here, we highlight four different methods for estimating CATEs, which illustrates patient-level treatment heterogeneity. For meta-learner methods such as T/S/X learner, random forest (`ranger`) is used as the base-learner. Alternatively, instead of relying on a single model, model selection (via cross validation or bootstrap based loss functions) or ensemble models such as SuperLearner could also be used. Hyper-parameter tuning is also generally recommended. 
+
+## S-Learner (Single Model)
+
+The S-Learner fits a single model $\hat{\mu}(X, T)$ using treatment as a feature, then estimates:
+$$\hat{\Delta}(x) = \hat{\mu}(x, T=1) - \hat{\mu}(x, T=0)$$
+
+```{r s-learner}
+# S-Learner: fit one random forest on (X, trt) -> Y
+dat_slearn <- data.frame(X_mat, trt = Trt, Y = Y)
+
+rf_s <- ranger(Y ~ ., data = dat_slearn)
+
+# Predict under trt=1 and trt=0 for each observation
+newdata_1 <- data.frame(X_mat, trt = 1)
+newdata_0 <- data.frame(X_mat, trt = 0)
+
+cate_slearner <- predict(rf_s, data = newdata_1)$predictions - 
+                 predict(rf_s, data = newdata_0)$predictions
+
+out <- c("S-Learner CATE summary:",
+         capture.output(summary(cate_slearner)),
+         paste("S-Learner MSE vs truth:", round(mean((cate_slearner - true_cate)^2), 4)))
+cat(paste(out, collapse = "\n"), "\n")
+```
+
+
+## T-Learner (Two Models)
+
+The T-Learner fits separate models for each treatment arm:
+$$\hat{\Delta}(x) = \hat{\mu}_1(x) - \hat{\mu}_0(x)$$
+
+```{r t-learner}
+# T-Learner: separate random forests for trt=1 and trt=0
+dat_trt1 <- data.frame(X_mat[Trt == 1, , drop = FALSE], Y = Y[Trt == 1])
+dat_trt0 <- data.frame(X_mat[Trt == 0, , drop = FALSE], Y = Y[Trt == 0])
+
+rf_t1 <- ranger(Y ~ ., data = dat_trt1)
+rf_t0 <- ranger(Y ~ ., data = dat_trt0)
+
+# Predict CATE for all observations
+cate_tlearner <- predict(rf_t1, data = data.frame(X_mat))$predictions - 
+                 predict(rf_t0, data = data.frame(X_mat))$predictions
+
+out <- c("T-Learner CATE summary:",
+         capture.output(summary(cate_tlearner)),
+         paste("T-Learner MSE vs truth:", round(mean((cate_tlearner - true_cate)^2), 4)))
+cat(paste(out, collapse = "\n"), "\n")
+```
+
+## X-Learner
+
+The X-Learner (Künzel et al., 2019) improves on the T-Learner by using cross-arm imputation of treatment effects. The procedure has three stages:
+
+1. Stage 1 — Fit separate outcome models for each arm (like the T-Learner):
+$$\hat{\mu}_0(x) = \hat{E}[Y \mid X=x, T=0], \quad \hat{\mu}_1(x) = \hat{E}[Y \mid X=x, T=1]$$
+
+2. Stage 2 — Impute individual treatment effects using the *other* arm's model:
+$$\tilde{D}_i^1 = Y_i^1 - \hat{\mu}_0(X_i) \quad \text{for treated} \qquad \tilde{D}_i^0 = \hat{\mu}_1(X_i) - Y_i^0 \quad \text{for control}$$
+Then fit CATE models $\hat{\Delta}_1(x)$ and $\hat{\Delta}_0(x)$ on each set of imputed effects.
+
+3. Stage 3 — Combine using propensity score weighting:
+$$\hat{\Delta}(x) = g(x) \cdot \hat{\Delta}_0(x) + (1 - g(x)) \cdot \hat{\Delta}_1(x)$$
+where $g(x) = P(T=1 \mid X=x)$ is the propensity score. In a randomized trial with 1:1 allocation, $g(x) = 0.5$, so the X-Learner simply averages the two CATE models.
+
+The X-Learner is particularly effective when treatment arms are unbalanced (the larger arm's model imputes more precise effects for the smaller arm), but it can still improve over the T-Learner even under balance by pooling information.
+
+```{r x-learner}
+# Stage 1: Fit separate outcome models (same as T-Learner)
+# We reuse rf_t1 and rf_t0 from the T-Learner section
+
+# Stage 2: Impute treatment effects via cross-arm prediction
+# For treated subjects: D_1 = Y_1 - mu_0(X_1)
+D_treated <- Y[Trt == 1] - predict(rf_t0, data = data.frame(X_mat[Trt == 1, , drop = FALSE]))$predictions
+
+# For control subjects: D_0 = mu_1(X_0) - Y_0
+D_control <- predict(rf_t1, data = data.frame(X_mat[Trt == 0, , drop = FALSE]))$predictions - Y[Trt == 0]
+
+# Fit CATE models on imputed effects
+rf_tau1 <- ranger(D ~ ., data = data.frame(X_mat[Trt == 1, , drop = FALSE], D = D_treated))
+rf_tau0 <- ranger(D ~ ., data = data.frame(X_mat[Trt == 0, , drop = FALSE], D = D_control))
+
+# Stage 3: Combine with propensity weighting
+# In 1:1 RCT, g(x) = 0.5, so this is simply the average
+tau_from_treated <- predict(rf_tau1, data = data.frame(X_mat))$predictions
+tau_from_control <- predict(rf_tau0, data = data.frame(X_mat))$predictions
+
+g_x <- 0.5  # propensity score under 1:1 randomization
+cate_xlearner <- g_x * tau_from_control + (1 - g_x) * tau_from_treated
+
+out <- c("X-Learner CATE summary:",
+         capture.output(summary(cate_xlearner)),
+         paste("X-Learner MSE vs truth:", round(mean((cate_xlearner - true_cate)^2), 4)))
+cat(paste(out, collapse = "\n"), "\n")
+```
+
+## Causal Forest (grf)
+
+The Causal Forest from `grf` directly targets $\Delta(x) = E[Y(1) - Y(0) \mid X = x]$ via honest estimation with forest-based adaptive neighborhoods. A nice bonus of this package is built-in variable importance, which roughly looks at how often a covariate or feature was used for tree splits. 
+
+```{r causal-forest}
+cf <- causal_forest(
+  X = X_mat, Y = Y, W = Trt,
+  num.trees = 2000,
+  honesty = TRUE,
+  tune.parameters = "all"
+)
+
+cate_cf <- predict(cf)$predictions
+
+out <- c("Causal Forest CATE summary:",
+         capture.output(summary(cate_cf)),
+         paste("Causal Forest MSE vs truth:", round(mean((cate_cf - true_cate)^2), 4)))
+cat(paste(out, collapse = "\n"), "\n")
+
+# Variable importance from causal forest
+varimp_cf <- variable_importance(cf)
+varimp_df <- data.frame(
+  variable = colnames(X_mat),
+  importance = as.numeric(varimp_cf)
+) %>% arrange(desc(importance))
+```
+
+```{r varimp-plot, fig.height=5}
+# Variable importance from causal forest
+top_vars <- head(varimp_df, 10)
+ggplot(top_vars, aes(x = reorder(variable, importance), y = importance)) +
+  geom_col(fill = "grey30") +
+  coord_flip() +
+  labs(
+    title = "Causal Forest Variable Importance (Top 10)",
+    x = NULL, y = "Importance",
+    caption = "True predictive variables: X3, X4, X7"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid = element_blank())
+```
+
+## Compare CATE Estimates
+
+```{r compare-cate, fig.height=10}
+cate_df <- data.frame(
+  true_cate = true_cate,
+  S_Learner = cate_slearner,
+  T_Learner = cate_tlearner,
+  Causal_Forest = cate_cf,
+  X_Learner = cate_xlearner
+) %>%
+  pivot_longer(cols = -true_cate, names_to = "Method", values_to = "Estimated_CATE")
+
+# Scatter: estimated vs true
+ggplot(cate_df, aes(x = true_cate, y = Estimated_CATE)) +
+  geom_point(alpha = 0.3, size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~ Method, ncol = 2) +
+  labs(
+    title = "Estimated CATE vs. True CATE by Method",
+    x = "True CATE",
+    y = "Estimated CATE"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid = element_blank(), strip.text = element_text(face = "bold"))
+```
+
+```{r mse-comparison}
+mse_df <- data.frame(
+  Method = c("S-Learner", "T-Learner", "Causal Forest", "X-Learner"),
+  MSE = c(
+    mean((cate_slearner - true_cate)^2),
+    mean((cate_tlearner - true_cate)^2),
+    mean((cate_cf - true_cate)^2),
+    mean((cate_xlearner - true_cate)^2)
+  ),
+  Correlation = c(
+    cor(cate_slearner, true_cate),
+    cor(cate_tlearner, true_cate),
+    cor(cate_cf, true_cate),
+    cor(cate_xlearner, true_cate)
+  )
+)
+
+knitr::kable(mse_df, digits = 4, caption = "CATE Estimation Performance")
+```
+
+
+# Subgroup Identification
+
+This section focuses on identifying interpretable subgroups. 
+
+## Virtual Twins
+
+The Virtual Twins approach [@foster2011subgroup] is a two-step procedure:
+
+1. Step 1: Estimate individual-level CATEs (we use the T-Learner random forest estimates)
+2. Step 2: Fit a regression tree on the estimated CATEs to define subgroups
+
+We limit the tree to `maxdepth = 2` (at most two levels of splits from the root, yielding up to 4 terminal nodes). This keeps the subgroup rules simple and interpretable, which is important for clinical communication.
+
+```{r virtual-twins}
+# Step 1: Use T-Learner CATE as the "virtual twin" difference
+# (already computed above as cate_tlearner)
+
+# Step 2: Fit a regression tree on CATEs to identify subgroups
+vt_dat <- data.frame(X_covs, cate = cate_tlearner)
+
+vt_tree <- rpart(
+  cate ~ ., data = vt_dat,
+  control = rpart.control(
+    cp = 0.02,          # complexity parameter
+    minsplit = 40,       # min obs to attempt split
+    minbucket = 20,      # min obs in terminal node
+    maxdepth = 2         # limit tree depth (root + 2 splits → max 4 leaves)
+  )
+)
+
+# Print and plot the tree
+out <- c("Virtual Twins Tree:", capture.output(print(vt_tree)))
+cat(paste(out, collapse = "\n"), "\n")
+```
+
+```{r vt-tree-plot, fig.height=6}
+rpart.plot(
+  vt_tree, 
+  main = "Virtual Twins: Subgroup Tree from T-Learner CATEs",
+  extra = 101,  # show n and percent
+  box.palette = "GnBu",
+  shadow.col = "gray",
+  nn = TRUE
+)
+```
+
+```{r vt-subgroups, fig.height=5}
+# Assign subgroup labels
+dat$vt_subgroup <- as.factor(predict(vt_tree, newdata = X_covs, type = "vector"))
+dat$vt_subgroup_label <- paste0("Subgroup (CATE≈", round(as.numeric(as.character(dat$vt_subgroup)), 2), ")")
+
+# Compare true CATEs within each VT subgroup
+ggplot(dat, aes(x = vt_subgroup_label, y = trt_effect)) +
+  geom_boxplot(fill = "grey80", outlier.size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "True CATE Distribution Within Virtual Twins Subgroups",
+    x = "Virtual Twins Subgroup (predicted CATE)",
+    y = "True CATE"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+```
+
+
+## Model-Based Recursive Partitioning (MOB)
+
+MOB [@zeileis2008model] fits a parametric model in each node and recursively searches for partitioning variables that create instability in model parameters. Here, the base model is $Y = \beta_0 + \beta_1 \cdot \text{trt} + \beta_{prog} X_{prog}$ where $X_{prog}$ corresponds to the variables identified as prognostic in the elastic net screening. As with Virtual Twins, we limit the tree to `maxdepth = 2` (at most two levels of splits) to keep the resulting subgroups simple and interpretable.
+
+```{r mob-fit}
+# Fit MOB: Y ~ trt (+ screened prognostic vars) | all X variables for partitioning
+# We use the variables identified by elastic net screening as node covariates
+mob_dat <- data.frame(Y = Y, trt = Trt, X_covs)
+
+cov_names <- colnames(X_covs)
+
+# Build MOB formula using elastic-net-selected variables in the node model
+selected_vars <- selected_vars_enet
+if (length(selected_vars) > 0) {
+  node_vars <- intersect(selected_vars, cov_names)
+  if (length(node_vars) > 0) {
+    mob_formula <- as.formula(
+      paste0("Y ~ trt + ", paste(node_vars, collapse = " + "), " | ", 
+             paste(cov_names, collapse = " + "))
+    )
+  } else {
+    mob_formula <- as.formula(paste0("Y ~ trt | ", paste(cov_names, collapse = " + ")))
+  }
+} else {
+  mob_formula <- as.formula(paste0("Y ~ trt | ", paste(cov_names, collapse = " + ")))
+}
+
+cat("MOB formula:", deparse(mob_formula), "\n")
+
+mob_tree <- glmtree(
+  mob_formula,
+  data = mob_dat,
+  family = gaussian,
+  parm = 2,                        # test instability in trt coefficient
+  minsize = floor(0.15 * N),       # min node size (15% of N)
+  maxdepth = 2L,                   # limit tree depth (root + 2 splits → max 4 leaves)
+  alpha = 0.05,                    # significance level for splits
+  bonferroni = TRUE                # adjust for multiple testing
+)
+# Estimate CATE from MOB
+cate_mob <- predict(mob_tree, newdata = mob_dat %>% mutate(trt = 1), type = "response") -
+            predict(mob_tree, newdata = mob_dat %>% mutate(trt = 0), type = "response")
+```
+
+```{r mob-plot, fig.height=7}
+plot(mob_tree, main = "MOB: Treatment Effect Partitioning",
+     tp_args = list(which = "trt"))
+```
+
+
+```{r mob-subgroup-boxplot, fig.height=5}
+dat$mob_node <- predict(mob_tree, type = "node")
+ggplot(dat, aes(x = factor(mob_node), y = trt_effect)) +
+  geom_boxplot(fill = "grey80", outlier.size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "True CATE Distribution Within MOB Subgroups",
+    x = "MOB Terminal Node",
+    y = "True CATE"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid = element_blank())
+```
+
+
+## `personalized` Package (Linear Regression Learner)
+
+The [`personalized`](https://CRAN.R-project.org/package=personalized) package [@personalized2024; @chen2017general] provides a unified framework for subgroup identification and treatment effect estimation. Here, we use linear regression as the outcome model. This produces a model-based subgroup rule and the estimated CATE is a linear function of covariates. and the sign of the prediction determines whether a patient is classified as "Benefitting" or "Non-Benefitting."
+
+The key steps:
+
+1. Propensity score estimation: We use logistic regression to estimate $P(\text{Trt}=1 \mid X)$ (in a 1:1 RCT this is essentially $0.5$, but the package requires it).
+2. Outcome model: A linear model (augmentation model) fitted to each arm.
+3. Treatment rule: Patients are assigned to "Benefitting" if their predicted CATE > 0, and "Non-Benefitting" otherwise.
+
+The advantage of a linear learner is interpretability — the subgroup rule is a weighted combination of covariates, not an opaque tree or forest.
+
+```{r personalized-fit}
+# Prepare data for personalized package
+# The package expects: x (covariate matrix), trt (0/1 or -1/1), y (outcome)
+# We'll use the numeric model matrix
+X_pers <- X_mat
+
+# Fit propensity score model (logistic regression)
+propensity_func <- function(x, trt) {
+  df <- data.frame(trt = trt, x)
+  fit <- glm(trt ~ ., data = df, family = binomial)
+  predict(fit, type = "response")
+}
+
+# Fit the personalized model with linear regression as the outcome learner
+# loss = "sq_loss_lasso" uses penalized linear regression for the contrast function
+pers_fit <- fit.subgroup(
+  x = X_pers,
+  y = Y,
+  trt = Trt,
+  propensity.func = propensity_func,
+  loss = "sq_loss_lasso",  # linear (lasso-penalized) outcome model
+  nfolds = 5               # CV folds for lasso tuning
+)
+
+out <- c("Personalized model summary:", capture.output(print(pers_fit)))
+cat(paste(out, collapse = "\n"), "\n")
+```
+
+```{r personalized-subgroups, fig.height=5}
+# Extract subgroup assignments: personalized assigns "Recommended trt" 
+# benefit.scores > 0 => recommend treatment (Benefitting)
+# benefit.scores <= 0 => recommend control (Non-Benefitting)
+dat$pers_benefit_score <- pers_fit$benefit.scores
+dat$pers_subgroup <- ifelse(pers_fit$benefit.scores > 0, "B", "NB")
+
+out <- c("Personalized subgroup counts:",
+         capture.output(print(table(dat$pers_subgroup))))
+cat(paste(out, collapse = "\n"), "\n")
+
+# Boxplot of true CATEs by Personalized subgroup
+ggplot(dat, aes(x = pers_subgroup, y = trt_effect, fill = pers_subgroup)) +
+  geom_boxplot(outlier.size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  scale_fill_manual(values = c("B" = "#4DAF4A", "NB" = "#E41A1C"), guide = "none") +
+  labs(
+    title = "True CATE Distribution Within Personalized Subgroups",
+    subtitle = "B = Benefitting (predicted CATE > 0), NB = Non-Benefitting",
+    x = "Subgroup", y = "True CATE"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid = element_blank())
+```
+
+```{r personalized-benefit-vs-truth, fig.height=5}
+# Scatter: personalized benefit score vs true CATE
+ggplot(dat, aes(x = trt_effect, y = pers_benefit_score, color = pers_subgroup)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_vline(xintercept = 0, linetype = "dotted") +
+  scale_color_manual(values = c("B" = "#4DAF4A", "NB" = "#E41A1C")) +
+  labs(
+    title = "Personalized Benefit Score vs. True CATE",
+    x = "True CATE", y = "Estimated Benefit Score",
+    color = "Subgroup"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid = element_blank(), legend.position = "top")
+```
+
+
+## Benefitting vs. Non-Benefitting
+
+For practical implementation, it is often needed to classify which patients should receive the treatment and which shouldn't. This can guide decision making for subsequent clinical trials. To do this, subgroup assignments are collapsed into the following groups:
+
+- "B" (Benefitting): subgroup-level mean CATE > 0 (treatment is beneficial on average)
+- "NB" (Non-Benefitting): subgroup-level mean CATE ≤ 0 (treatment is not beneficial on average)
+
+
+```{r binary-subgroups}
+# --- Virtual Twins: classify leaves as B/NB based on mean predicted CATE ---
+vt_leaf <- as.character(vt_tree$where)
+vt_leaf_mean_cate <- tapply(cate_tlearner, vt_leaf, mean)
+vt_leaf_class <- ifelse(vt_leaf_mean_cate > 0, "B", "NB")
+dat$vt_binary <- vt_leaf_class[vt_leaf]
+
+# --- MOB: classify nodes as B/NB based on mean predicted CATE ---
+mob_nodes <- as.character(predict(mob_tree, type = "node"))
+mob_node_mean_cate <- tapply(cate_mob, mob_nodes, mean)
+mob_node_class <- ifelse(mob_node_mean_cate > 0, "B", "NB")
+dat$mob_binary <- mob_node_class[mob_nodes]
+
+# --- Personalized: already have binary from benefit score sign ---
+# dat$pers_subgroup already set above
+
+# ============================================================
+# Summarize subgroup rules for each method
+# ============================================================
+
+# Build all output lines, then print once for clean knitted output
+out <- character()
+out <- c(out, "=== Subgroup Rules: B (Benefitting) vs. NB (Non-Benefitting) ===", "")
+
+# --- Virtual Twins ---
+out <- c(out, "--- Virtual Twins ---")
+vt_rules <- rpart.rules(vt_tree, style = "tall")
+vt_rules_df <- data.frame(
+  leaf = rownames(vt_rules),
+  rule = apply(vt_rules, 1, function(r) paste(trimws(r), collapse = " ")),
+  stringsAsFactors = FALSE
+)
+# Remove "when" from rule text and map to B/NB
+vt_rules_df$rule <- gsub(" when ", " ", vt_rules_df$rule)
+for (i in seq_len(nrow(vt_rules_df))) {
+  leaf_id <- as.character(which(rownames(vt_tree$frame) == vt_rules_df$leaf[i]))
+  label <- vt_leaf_class[leaf_id]
+  n_leaf <- sum(vt_leaf == leaf_id)
+  out <- c(out, paste0("  ", label, ": ", vt_rules_df$rule[i], "  (n = ", n_leaf, ")"))
+}
+out <- c(out, "")
+
+# --- MOB ---
+out <- c(out, "--- MOB ---")
+mob_rules <- partykit:::.list.rules.party(mob_tree)
+# Round numeric split values in rule text
+round_numbers_in_text <- function(txt, digits = 2) {
+  m <- gregexpr("-?\\d+\\.\\d+", txt, perl = TRUE)
+  regmatches(txt, m) <- lapply(regmatches(txt, m), function(x) {
+    round(as.numeric(x), digits)
+  })
+  txt
+}
+mob_rules <- sapply(mob_rules, round_numbers_in_text)
+for (nid in names(mob_rules)) {
+  label <- mob_node_class[nid]
+  mean_cate <- round(mob_node_mean_cate[nid], 2)
+  n_node <- sum(mob_nodes == nid)
+  rule_text <- mob_rules[nid]
+  out <- c(out, paste0("  ", label, ": ", rule_text, "  (mean CATE = ", mean_cate,
+                        ", n = ", n_node, ")"))
+}
+out <- c(out, "")
+
+# --- Personalized ---
+pers_coefs <- coef(pers_fit$model)
+nonzero_idx <- which(pers_coefs != 0)
+out <- c(out,
+  "--- Personalized ---",
+  paste0("  B: benefit score > 0  (n = ", sum(dat$pers_subgroup == "B"), ")"),
+  paste0("  NB: benefit score <= 0  (n = ", sum(dat$pers_subgroup == "NB"), ")"),
+  "  Benefit score is a linear combination of covariates (lasso).",
+  "  Non-zero coefficients:"
+)
+if (length(nonzero_idx) > 0) {
+  nonzero_coefs <- pers_coefs[nonzero_idx]
+  names(nonzero_coefs) <- rownames(pers_coefs)[nonzero_idx]
+  for (nm in names(sort(abs(nonzero_coefs), decreasing = TRUE))) {
+    out <- c(out, paste0("    ", nm, " = ", round(nonzero_coefs[nm], 4)))
+  }
+}
+
+cat(paste(out, collapse = "\n"), "\n")
+```
+
+```{r binary-subgroup-boxplots, fig.height=5, fig.width=10}
+# Compare true CATE distributions across methods
+binary_df <- dat %>%
+  select(trt_effect, vt_binary, mob_binary, pers_subgroup) %>%
+  pivot_longer(cols = c(vt_binary, mob_binary, pers_subgroup),
+               names_to = "method", values_to = "subgroup") %>%
+  mutate(method = recode(method,
+    "vt_binary" = "Virtual Twins",
+    "mob_binary" = "MOB",
+    "pers_subgroup" = "Personalized"
+  ))
+
+ggplot(binary_df, aes(x = subgroup, y = trt_effect, fill = subgroup)) +
+  geom_boxplot(outlier.size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~ method) +
+  scale_fill_manual(values = c("B" = "#4DAF4A", "NB" = "#E41A1C"), guide = "none") +
+  labs(
+    title = "True CATE Distribution by Binary Subgroup (B vs. NB)",
+    subtitle = "B = Benefitting (mean CATE > 0), NB = Non-Benefitting (mean CATE ≤ 0)",
+    x = "Subgroup", y = "True CATE"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid = element_blank(), strip.text = element_text(face = "bold"))
+```
+
+
+# Subgroup-Level Treatment Effect Estimation
+
+Having identified binary (Benefitting vs. Non-Benefitting) subgroups via Virtual Twins, MOB, and Personalized, subgroup-level treatment effects are now estimated using four approaches. The CATE + subgroup identification pipeline are first converted into functions for use with `boot::boot()`.
+
+## Reusable Functions
+
+1. CATE estimation (T-Learner, used as the default)
+2. Subgroup identification (VT, MOB, Personalized) — each returns binary B/NB assignments
+3. Subgroup treatment effect estimation — naive difference-in-means within each binary subgroup
+
+
+```{r define-functions}
+# ============================================================
+# CATE Estimation Functions
+# ============================================================
+
+#' T-Learner CATE estimation
+#' @param Y outcome vector
+#' @param Trt treatment indicator (0/1)
+#' @param X_mat numeric covariate matrix
+#' @param X_mat_pred covariate matrix for prediction (default: X_mat)
+#' @return vector of CATE estimates (one per row of X_mat_pred)
+estimate_cate_tlearner <- function(Y, Trt, X_mat, X_mat_pred = X_mat) {
+  dat_trt <- data.frame(X_mat[Trt == 1, , drop = FALSE], Y = Y[Trt == 1])
+  dat_ctl <- data.frame(X_mat[Trt == 0, , drop = FALSE], Y = Y[Trt == 0])
+  
+  rf1 <- ranger(Y ~ ., data = dat_trt, num.trees = 500, min.node.size = 5)
+  rf0 <- ranger(Y ~ ., data = dat_ctl, num.trees = 500, min.node.size = 5)
+  
+  predict(rf1, data = data.frame(X_mat_pred))$predictions -
+    predict(rf0, data = data.frame(X_mat_pred))$predictions
+}
+
+# ============================================================
+# Subgroup Identification Functions
+# Each returns a character vector of "B" or "NB" for each observation
+# ============================================================
+
+#' Virtual Twins subgroup identification
+#' @param cate vector of CATE estimates
+#' @param X_covs data frame of covariates
+#' @return character vector "B"/"NB" for each observation
+identify_subgroups_vt <- function(cate, X_covs) {
+  vt_dat <- data.frame(X_covs, cate = cate)
+  tree <- rpart(
+    cate ~ ., data = vt_dat,
+    control = rpart.control(cp = 0.02, minsplit = 40, minbucket = 20, maxdepth = 2)
+  )
+  leaf <- as.character(tree$where)
+  leaf_mean <- tapply(cate, leaf, mean)
+  leaf_class <- ifelse(leaf_mean > 0, "B", "NB")
+  leaf_class[leaf]
+}
+
+#' MOB subgroup identification
+#' @param Y outcome vector
+#' @param Trt treatment indicator
+#' @param X_covs data frame of covariates
+#' @return character vector "B"/"NB" for each observation
+identify_subgroups_mob <- function(Y, Trt, X_covs) {
+  mob_dat <- data.frame(Y = Y, trt = Trt, X_covs)
+  cov_names <- colnames(X_covs)
+  
+  # Use simple Y ~ trt | X formula (skip lasso for bootstrap speed)
+  mob_formula <- as.formula(paste0("Y ~ trt | ", paste(cov_names, collapse = " + ")))
+  
+  tree <- tryCatch(
+    glmtree(mob_formula, data = mob_dat, family = gaussian,
+            parm = 2, minsize = floor(0.15 * nrow(mob_dat)),
+            maxdepth = 2L, alpha = 0.05, bonferroni = TRUE),
+    error = function(e) NULL
+  )
+  
+  if (is.null(tree)) {
+    # If MOB fails to split, assign everyone to "B"
+    return(rep("B", nrow(mob_dat)))
+  }
+  
+  # Get CATE per node
+  cate_mob <- predict(tree, newdata = mob_dat %>% mutate(trt = 1), type = "response") -
+              predict(tree, newdata = mob_dat %>% mutate(trt = 0), type = "response")
+  nodes <- as.character(predict(tree, type = "node"))
+  node_mean <- tapply(cate_mob, nodes, mean)
+  node_class <- ifelse(node_mean > 0, "B", "NB")
+  node_class[nodes]
+}
+
+#' Personalized (lasso LM) subgroup identification
+#' @param Y outcome vector
+#' @param Trt treatment indicator
+#' @param X_mat numeric covariate matrix
+#' @return character vector "B"/"NB" for each observation
+identify_subgroups_personalized <- function(Y, Trt, X_mat) {
+  prop_func <- function(x, trt) {
+    df <- data.frame(trt = trt, x)
+    fit <- glm(trt ~ ., data = df, family = binomial)
+    predict(fit, type = "response")
+  }
+  
+  fit <- tryCatch(
+    fit.subgroup(x = X_mat, y = Y, trt = Trt,
+                 propensity.func = prop_func,
+                 loss = "sq_loss_lasso", nfolds = 5),
+    error = function(e) NULL
+  )
+  
+  if (is.null(fit)) return(rep("B", length(Y)))
+  ifelse(fit$benefit.scores > 0, "B", "NB")
+}
+
+# ============================================================
+# Subgroup Treatment Effect Estimation (Naive)
+# ============================================================
+
+#' Compute naive treatment effect within binary subgroups using lm(Y ~ Trt)
+#' @param Y outcome
+#' @param Trt treatment indicator
+#' @param subgroup character vector of "B"/"NB"
+#' @return named vector: c(B = effect_B, NB = effect_NB)
+subgroup_effects_naive <- function(Y, Trt, subgroup) {
+  result <- c(B = NA_real_, NB = NA_real_)
+  for (s in c("B", "NB")) {
+    idx <- subgroup == s
+    if (sum(idx & Trt == 1) > 1 && sum(idx & Trt == 0) > 1) {
+      fit <- lm(Y[idx] ~ Trt[idx])
+      result[s] <- coef(fit)["Trt[idx]"]
+    }
+  }
+  result
+}
+```
+
+
+## Naive Estimator
+
+The naive estimator computes the unadjusted difference in means between treatment arms within each binary subgroup, equivalent to fitting `lm(Y ~ trt)` within each subgroup. In general, this approach does not account for the subgroup identification process and is not recommended. 
+
+```{r naive-binary}
+# Compute naive estimates for each subgroup method using lm(Y ~ Trt)
+naive_results <- data.frame()
+
+for (sg_method in c("Virtual Twins", "MOB", "Personalized")) {
+  sg_col <- switch(sg_method,
+    "Virtual Twins" = "vt_binary",
+    "MOB" = "mob_binary",
+    "Personalized" = "pers_subgroup"
+  )
+  
+  for (s in c("B", "NB")) {
+    idx <- dat[[sg_col]] == s
+    n_s <- sum(idx)
+    n_trt <- sum(idx & Trt == 1)
+    n_ctl <- sum(idx & Trt == 0)
+    
+    if (n_trt > 1 & n_ctl > 1) {
+      fit <- lm(Y[idx] ~ Trt[idx])
+      est <- coef(fit)["Trt[idx]"]
+      se  <- summary(fit)$coefficients["Trt[idx]", "Std. Error"]
+      ci  <- confint(fit)["Trt[idx]", ]
+      true_ate <- mean(true_cate[idx])
+      
+      naive_results <- bind_rows(naive_results, data.frame(
+        sg_method = sg_method, subgroup = s, n = n_s,
+        estimate = est, se = se,
+        lower = ci[1],
+        upper = ci[2],
+        true_ate = true_ate,
+        est_method = "Naive"
+      ))
+    }
+  }
+}
+```
+
+
+## Bootstrap (Refit all)
+
+This approach uses bootstrap resampling (e.g. `boot::boot()`) to construct subgroup-specific CIs that account for the uncertainty in CATE estimation and subgroup identification. For each bootstrap resample:
+
+1. Re-estimate CATEs (T-Learner)
+2. Re-run the subgroup identification model (VT, MOB, or Personalized)
+3. Re-classify into B/NB based on the new subgroup model
+4. Compute $E[Y \mid \text{Trt}=1, S=s] - E[Y \mid \text{Trt}=0, S=s]$ for each subgroup
+
+This yields a bootstrap distribution of subgroup estimates. Following @foster2011subgroup, the bootstrap bias-corrected estimate is $\hat{\Delta}_{BC} = 2\hat{\Delta} - \bar{\Delta}^{*}$, where $\hat{\Delta}$ is the original-sample estimate and $\bar{\Delta}^{*}$ is the bootstrap mean. This corrects for the optimistic bias that arises when the same data are used to both identify subgroups and estimate effects within them. For results throughout, 95% CIs are obtained via percentile method. 
+
+```{r boot-statistic-functions}
+# Boot statistic functions for each subgroup method.
+# Each calls the reusable functions defined above (estimate_cate_tlearner,
+# identify_subgroups_*, subgroup_effects_naive) to ensure consistent
+# tuning parameters between the original fit and bootstrap resamples.
+# Returns: c(effect_B, effect_NB)
+
+boot_stat_vt <- function(data, indices) {
+  d <- data[indices, ]
+  Y_b <- d$Y; Trt_b <- d$Trt
+  X_mat_b <- as.matrix(d[, grep("^X", colnames(d))])
+  X_covs_b <- d[, grep("^X", colnames(d)), drop = FALSE]
+  
+  # Re-estimate CATEs
+  cate_b <- estimate_cate_tlearner(Y_b, Trt_b, X_mat_b)
+  
+  # Re-identify subgroups
+  sg_b <- identify_subgroups_vt(cate_b, X_covs_b)
+  
+  # Compute subgroup effects
+  subgroup_effects_naive(Y_b, Trt_b, sg_b)
+}
+
+boot_stat_mob <- function(data, indices) {
+  d <- data[indices, ]
+  Y_b <- d$Y; Trt_b <- d$Trt
+  X_covs_b <- d[, grep("^X", colnames(d)), drop = FALSE]
+  
+  # MOB re-identification (CATE is estimated internally by MOB)
+  sg_b <- identify_subgroups_mob(Y_b, Trt_b, X_covs_b)
+  
+  # Compute subgroup effects
+  subgroup_effects_naive(Y_b, Trt_b, sg_b)
+}
+
+boot_stat_pers <- function(data, indices) {
+  d <- data[indices, ]
+  Y_b <- d$Y; Trt_b <- d$Trt
+  X_mat_b <- as.matrix(d[, grep("^X", colnames(d))])
+  
+  # Re-identify subgroups
+  sg_b <- identify_subgroups_personalized(Y_b, Trt_b, X_mat_b)
+  
+  # Compute subgroup effects
+  subgroup_effects_naive(Y_b, Trt_b, sg_b)
+}
+```
+
+```{r boot-run}
+# Prepare data for boot (combine Y, Trt, and covariates)
+boot_data <- data.frame(Y = Y, Trt = Trt, X_mat)
+
+B_boot <- 200  # bootstrap replicates (balance computation vs. precision)
+
+set.seed(2026)
+
+cat("Running bootstrap for Virtual Twins...\n")
+boot_vt <- boot(data = boot_data, statistic = boot_stat_vt, R = B_boot)
+
+cat("Running bootstrap for MOB...\n")
+boot_mob <- boot(data = boot_data, statistic = boot_stat_mob, R = B_boot)
+
+cat("Running bootstrap for Personalized...\n")
+boot_pers <- boot(data = boot_data, statistic = boot_stat_pers, R = B_boot)
+```
+
+```{r boot-ci}
+# Extract bootstrap CIs using percentile method.
+# The forest plot uses the bootstrap mean as the point estimate.
+# The summary table additionally reports the Foster et al. (2011)
+# bias-corrected estimate: theta_BC = 2 * theta_hat - mean(theta_star).
+extract_boot_ci <- function(boot_obj, sg_method, original_subgroups, true_cates) {
+  results <- data.frame()
+  
+  for (i in 1:2) {
+    s <- c("B", "NB")[i]
+    
+    # Get bootstrap CI (percentile method)
+    ci <- tryCatch(
+      boot.ci(boot_obj, index = i, type = "perc", conf = 0.95),
+      error = function(e) NULL
+    )
+    
+    # Bootstrap mean (observed) — used as point estimate in forest plot
+    boot_mean <- mean(boot_obj$t[, i], na.rm = TRUE)
+    # Bias-corrected estimate (Foster et al. 2011) — reported in summary table
+    bias_corrected <- 2 * boot_obj$t0[i] - boot_mean
+    se  <- sd(boot_obj$t[, i], na.rm = TRUE)
+    
+    if (!is.null(ci) && !is.null(ci$percent)) {
+      lower <- ci$percent[4]
+      upper <- ci$percent[5]
+    } else {
+      lower <- quantile(boot_obj$t[, i], 0.025, na.rm = TRUE)
+      upper <- quantile(boot_obj$t[, i], 0.975, na.rm = TRUE)
+    }
+    
+    true_ate <- mean(true_cates[original_subgroups == s])
+    n_s <- sum(original_subgroups == s)
+    
+    results <- bind_rows(results, data.frame(
+      sg_method = sg_method, subgroup = s, n = n_s,
+      estimate = boot_mean, bias_corrected = bias_corrected, se = se,
+      lower = lower, upper = upper,
+      true_ate = true_ate,
+      est_method = "Bootstrap (Refit)"
+    ))
+  }
+  results
+}
+
+boot_results_vt <- extract_boot_ci(boot_vt, "Virtual Twins", dat$vt_binary, true_cate)
+boot_results_mob <- extract_boot_ci(boot_mob, "MOB", dat$mob_binary, true_cate)
+boot_results_pers <- extract_boot_ci(boot_pers, "Personalized", dat$pers_subgroup, true_cate)
+
+boot_results <- bind_rows(boot_results_vt, boot_results_mob, boot_results_pers)
+```
+
+```{r boot-diagnostics, fig.height=5, fig.width=10}
+# Visualize bootstrap distributions
+boot_dist <- bind_rows(
+  data.frame(sg_method = "Virtual Twins", B = boot_vt$t[, 1], NB = boot_vt$t[, 2]),
+  data.frame(sg_method = "MOB", B = boot_mob$t[, 1], NB = boot_mob$t[, 2]),
+  data.frame(sg_method = "Personalized", B = boot_pers$t[, 1], NB = boot_pers$t[, 2])
+) %>%
+  pivot_longer(cols = c(B, NB), names_to = "subgroup", values_to = "effect")
+
+ggplot(boot_dist, aes(x = effect, fill = subgroup)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+  facet_wrap(~ sg_method, scales = "free_x") +
+  scale_fill_manual(values = c("B" = "#4DAF4A", "NB" = "#E41A1C")) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Bootstrap Distributions of Subgroup Treatment Effects (Refit)",
+    x = "Treatment Effect", y = "Count", fill = "Subgroup"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(panel.grid = element_blank(), legend.position = "top")
+```
+
+
+## Debiased Bootstrap
+
+@guo2021inference proposed a resampling-based bias-correction method that adjusts for subgroup selection, but without the need to repeat the entire subgroup identification algorithm. Following @zhao2023inference, the bootstrap method is as follows:
+
+1. The observed data consist of $n$ independent observations. Each patient $i$ has outcome $Y_i$, treatment $\text{Trt}_i$, and belongs to a candidate subgroup $S_i \in \{B, NB\}$, where the subgroup labels are generated once in the identification phase and then held fixed.
+
+2. Create a nonparametric bootstrap sample by sampling $n$ patients with replacement. The estimated treatment effect in subgroup $s$ in bootstrap sample $b$ is denoted $\hat{\Delta}^*_{s,b}$. Define $\hat{\Delta}_{\max} = \max_s \hat{\Delta}_s$ as the largest observed subgroup treatment effect (i.e., the effect in the identified benefitting subgroup). Given asymptotic normality and bootstrap consistency, the bias between the true effect $\Delta_s$ and the estimated effect $\hat{\Delta}_s$ in subgroup $s$ can be learned through the bias between $\hat{\Delta}_s$ and the bootstrap-adjusted estimate $\hat{\Delta}^*_{s,b} + d_s$, where the adjustment value is:
+$$d_s = (1 - n^{r - 0.5})(\hat{\Delta}_{\max} - \hat{\Delta}_s)$$
+and $r \in (0, 0.5)$ is a tuning parameter (we use $r = 1/12$).
+
+3. Obtain the debiased estimator by removing from $\hat{\Delta}_{\max}$ the learned bias from bootstrap estimates:
+$$\hat{\Delta}_{\max,\text{debiased}} = \hat{\Delta}_{\max} - E^*\left[\max_s(\hat{\Delta}^*_s + d_s) - \hat{\Delta}_{\max}\right]$$
+The corresponding two-sided level $1-\alpha$ confidence interval is:
+$$\hat{\Delta}_{\max,\text{debiased}} \pm c_{\alpha/2}/\sqrt{n}$$
+where $c_{\alpha/2}$ is the $(1 - \alpha/2)$ quantile of $T^*_b = \sqrt{n}(\max_s(\hat{\Delta}^*_{s,b} + d_s) - \hat{\Delta}_{\max})$.
+
+The same logic applies symmetrically to the NB subgroup by targeting $\Delta_{\min} = \min_s \hat{\Delta}_s$.
+
+```{r debiased-bootstrap}
+# ============================================================
+# Debiased Bootstrap (Guo & He, 2021)
+# ============================================================
+# Key distinction from the refit bootstrap above:
+#   - Refit bootstrap: re-identifies subgroups in each resample (captures full uncertainty)
+#   - Debiased bootstrap: holds subgroup labels FIXED, only re-estimates effects
+#     within fixed labels. This is the "confirmation phase" approach.
+
+# --- Step 1: Fixed-label bootstrap statistic functions ---
+# These use the ORIGINAL subgroup labels and only re-estimate treatment effects.
+
+make_fixed_label_boot_stat <- function(fixed_labels) {
+  # fixed_labels: character vector of "B"/"NB" per patient (same order as boot_data)
+  function(data, indices) {
+    d <- data[indices, ]
+    sg <- fixed_labels[indices]  # carry the fixed labels along with resampled patients
+    Y_b <- d$Y
+    Trt_b <- d$Trt
+    
+    result <- c(B = NA_real_, NB = NA_real_)
+    for (s in c("B", "NB")) {
+      idx <- sg == s
+      n_trt <- sum(idx & Trt_b == 1)
+      n_ctl <- sum(idx & Trt_b == 0)
+      if (n_trt > 1 && n_ctl > 1) {
+        result[s] <- mean(Y_b[idx & Trt_b == 1]) - mean(Y_b[idx & Trt_b == 0])
+      }
+    }
+    result
+  }
+}
+
+# Create fixed-label boot statistics for each subgroup method
+boot_stat_vt_fixed   <- make_fixed_label_boot_stat(dat$vt_binary)
+boot_stat_mob_fixed  <- make_fixed_label_boot_stat(dat$mob_binary)
+boot_stat_pers_fixed <- make_fixed_label_boot_stat(dat$pers_subgroup)
+
+# --- Step 2: Run fixed-label bootstrap ---
+B_debias <- 2000  # more replicates for debiasing (no CATE refit, so much faster)
+
+set.seed(2026)
+
+cat("Running fixed-label bootstrap for Virtual Twins...\n")
+boot_vt_fixed <- boot(data = boot_data, statistic = boot_stat_vt_fixed, R = B_debias)
+
+cat("Running fixed-label bootstrap for MOB...\n")
+boot_mob_fixed <- boot(data = boot_data, statistic = boot_stat_mob_fixed, R = B_debias)
+
+cat("Running fixed-label bootstrap for Personalized...\n")
+boot_pers_fixed <- boot(data = boot_data, statistic = boot_stat_pers_fixed, R = B_debias)
+
+# --- Step 3: Apply debiased bootstrap ---
+
+debiased_subgroup <- function(boot_obj, n, r = 1/12, alpha = 0.05) {
+  beta_hat <- boot_obj$t0                          # original point estimates (B, NB)
+  k <- length(beta_hat)
+  B_boot <- nrow(boot_obj$t)
+  
+  # --- Debias the MAX (Benefitting subgroup) ---
+  beta_hat_max <- max(beta_hat)
+  di <- (1 - n^(r - 0.5)) * (beta_hat_max - beta_hat)  # offsets for max
+  
+  Tstar <- numeric(B_boot)
+  beta_star_max_mod <- numeric(B_boot)
+  valid_max <- rep(TRUE, B_boot)
+  
+  for (b in seq_len(B_boot)) {
+    beta_star <- boot_obj$t[b, ]
+    if (any(is.na(beta_star))) { valid_max[b] <- FALSE; next }
+    beta_star_mod <- beta_star + di
+    max_mod <- max(beta_star_mod)
+    Tstar[b] <- sqrt(n) * (max_mod - beta_hat_max)
+    beta_star_max_mod[b] <- max_mod
+  }
+  
+  Tstar <- Tstar[valid_max]
+  beta_star_max_mod <- beta_star_max_mod[valid_max]
+  
+  # Debiased estimate
+  bias_star <- mean(beta_star_max_mod - beta_hat_max)
+  beta_hat_max_debiased <- beta_hat_max - bias_star
+  se_max <- sd(beta_star_max_mod)
+  
+  # Two-sided CI: debiased ± c_{alpha/2} / sqrt(n)
+  c_lower <- quantile(Tstar, alpha / 2)
+  c_upper <- quantile(Tstar, 1 - alpha / 2)
+  lower_CI_max <- beta_hat_max_debiased - c_upper / sqrt(n)
+  upper_CI_max <- beta_hat_max_debiased - c_lower / sqrt(n)
+  
+  # --- Debias the MIN (Non-Benefitting subgroup) ---
+  beta_hat_min <- min(beta_hat)
+  di_min <- (1 - n^(r - 0.5)) * (beta_hat_min - beta_hat)  # offsets for min (≤ 0)
+  
+  Tstar_min <- numeric(B_boot)
+  beta_star_min_mod <- numeric(B_boot)
+  valid_min <- rep(TRUE, B_boot)
+  
+  for (b in seq_len(B_boot)) {
+    beta_star <- boot_obj$t[b, ]
+    if (any(is.na(beta_star))) { valid_min[b] <- FALSE; next }
+    beta_star_mod_min <- beta_star + di_min
+    min_mod <- min(beta_star_mod_min)
+    Tstar_min[b] <- sqrt(n) * (min_mod - beta_hat_min)
+    beta_star_min_mod[b] <- min_mod
+  }
+  
+  Tstar_min <- Tstar_min[valid_min]
+  beta_star_min_mod <- beta_star_min_mod[valid_min]
+  
+  # Debiased estimate for min
+  bias_star_min <- mean(beta_star_min_mod - beta_hat_min)
+  beta_hat_min_debiased <- beta_hat_min - bias_star_min
+  se_min <- sd(beta_star_min_mod)
+  
+  # Two-sided CI for min
+  c_lower_min <- quantile(Tstar_min, alpha / 2)
+  c_upper_min <- quantile(Tstar_min, 1 - alpha / 2)
+  lower_CI_min <- beta_hat_min_debiased - c_upper_min / sqrt(n)
+  upper_CI_min <- beta_hat_min_debiased - c_lower_min / sqrt(n)
+  
+  list(
+    beta_hat_max = beta_hat_max,
+    beta_hat_max_debiased = beta_hat_max_debiased,
+    lower_CI_max = lower_CI_max,
+    upper_CI_max = upper_CI_max,
+    se_max = se_max,
+    bias_max = bias_star,
+    max_subgroup = names(beta_hat)[which.max(beta_hat)],
+    beta_hat_min = beta_hat_min,
+    beta_hat_min_debiased = beta_hat_min_debiased,
+    lower_CI_min = lower_CI_min,
+    upper_CI_min = upper_CI_min,
+    se_min = se_min,
+    bias_min = bias_star_min,
+    min_subgroup = names(beta_hat)[which.min(beta_hat)],
+    r = r, alpha = alpha, n = n
+  )
+}
+
+# Apply to each subgroup identification method
+db_vt   <- debiased_subgroup(boot_vt_fixed,   n = nrow(boot_data))
+db_mob  <- debiased_subgroup(boot_mob_fixed,  n = nrow(boot_data))
+db_pers <- debiased_subgroup(boot_pers_fixed, n = nrow(boot_data))
+
+# --- Step 4: Compile results ---
+methods_vec <- c("Virtual Twins", "MOB", "Personalized")
+db_list <- list(db_vt, db_mob, db_pers)
+
+debiased_results <- bind_rows(
+  lapply(seq_along(methods_vec), function(j) {
+    db <- db_list[[j]]
+    m <- methods_vec[j]
+    
+    naive_B  <- naive_results[naive_results$sg_method == m & naive_results$subgroup == "B", ]
+    naive_NB <- naive_results[naive_results$sg_method == m & naive_results$subgroup == "NB", ]
+    
+    bind_rows(
+      data.frame(
+        sg_method = m, subgroup = "B",
+        n = naive_B$n,
+        estimate = db$beta_hat_max_debiased,
+        se = db$se_max,
+        lower = db$lower_CI_max,
+        upper = db$upper_CI_max,
+        true_ate = naive_B$true_ate,
+        est_method = "Debiased Bootstrap",
+        row.names = NULL
+      ),
+      data.frame(
+        sg_method = m, subgroup = "NB",
+        n = naive_NB$n,
+        estimate = db$beta_hat_min_debiased,
+        se = db$se_min,
+        lower = db$lower_CI_min,
+        upper = db$upper_CI_min,
+        true_ate = naive_NB$true_ate,
+        est_method = "Debiased Bootstrap",
+        row.names = NULL
+      )
+    )
+  })
+)
+
+# Print diagnostics (single cat for clean knitted output)
+out <- c(
+  "Debiased Bootstrap Results (Guo & He 2021)",
+  paste0("Fixed subgroup labels | Tuning parameter r = 1/12 | Two-sided 95% CI"),
+  paste0("Bootstrap replicates: ", B_debias),
+  ""
+)
+for (j in seq_along(methods_vec)) {
+  db <- db_list[[j]]
+  out <- c(out,
+    paste0(methods_vec[j], ":"),
+    paste0("  B:  original = ", round(db$beta_hat_max, 3),
+           "  debiased = ", round(db$beta_hat_max_debiased, 3),
+           "  bias = ", round(db$bias_max, 3),
+           "  95% CI = [", round(db$lower_CI_max, 3), ", ", round(db$upper_CI_max, 3), "]"),
+    paste0("  NB: original = ", round(db$beta_hat_min, 3),
+           "  debiased = ", round(db$beta_hat_min_debiased, 3),
+           "  bias = ", round(db$bias_min, 3),
+           "  95% CI = [", round(db$lower_CI_min, 3), ", ", round(db$upper_CI_min, 3), "]"),
+    ""
+  )
+}
+cat(paste(out, collapse = "\n"), "\n")
+```
+
+
+# Comparing All Subgroup-Level Estimation Approaches
+
+## Summary Table
+
+```{r combine-all-results}
+# Combine all estimation methods
+all_results <- bind_rows(
+  naive_results,
+  boot_results,
+  debiased_results
+) %>%
+  mutate(
+    # Fill bias_corrected as NA for non-bootstrap methods
+    bias_corrected = ifelse(is.na(bias_corrected), NA_real_, bias_corrected),
+    bias = estimate - true_ate,
+    covers = (true_ate >= lower) & (true_ate <= upper),
+    ci_width = upper - lower
+  )
+rownames(all_results) <- NULL
+
+knitr::kable(
+  all_results %>%
+    select(sg_method, subgroup, est_method, n, estimate, bias_corrected,
+           true_ate, bias, se, lower, upper, covers) %>%
+    arrange(sg_method, subgroup, est_method),
+  digits = 3,
+  col.names = c("SG Method", "Subgroup", "Est. Method", "n", "Estimate",
+                "Bias-Corrected", "True ATE", "Bias", "SE",
+                "Lower", "Upper", "Covers"),
+  caption = "Complete Subgroup Treatment Effect Estimates — All Methods"
+)
+```
+
+
+## Forest Plot
+
+```{r forest-plot-all, fig.height=9, fig.width=10}
+# Forest plot: all subgroup methods × estimation methods
+# Color by Benefitting / Non-Benefitting subgroup
+# y-axis shows clean method labels grouped by subgroup
+all_results <- all_results %>%
+  mutate(
+    subgroup_label = ifelse(subgroup == "B", "Benefitting", "Non-Benefitting"),
+    y_label = paste0(est_method)
+  )
+
+# Order: within each facet, group by subgroup (B then NB), then method
+method_order <- c("Naive", "Bootstrap (Refit)", "Debiased Bootstrap")
+all_results <- all_results %>%
+  mutate(y_label = factor(y_label, levels = rev(method_order)))
+
+ggplot(all_results, aes(y = y_label, x = estimate, color = subgroup_label)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.25) +
+  geom_point(aes(x = true_ate), shape = 18, size = 3, color = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+  facet_wrap(~ sg_method, ncol = 1, scales = "free_y") +
+  scale_color_manual(values = c("Benefitting" = "#4DAF4A", "Non-Benefitting" = "#E41A1C")) +
+  labs(
+    title = "Subgroup Treatment Effect Estimates — All Methods",
+    subtitle = "◆ = true subgroup ATE; colored points = estimate with 95% CI",
+    x = "Treatment Effect", y = NULL,
+    color = "Subgroup"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    strip.text = element_text(face = "bold")
+  )
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
+# References
