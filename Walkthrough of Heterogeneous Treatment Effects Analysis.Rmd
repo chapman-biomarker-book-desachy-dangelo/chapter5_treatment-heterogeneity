@@ -504,17 +504,17 @@ This section focuses on identifying interpretable subgroups.
 
 The Virtual Twins approach [@foster2011subgroup] is a two-step procedure:
 
-1. Step 1: Estimate individual-level CATEs (we use the T-Learner random forest estimates)
+1. Step 1: Estimate individual-level CATEs (we use the X-Learner estimates)
 2. Step 2: Fit a regression tree on the estimated CATEs to define subgroups
 
 We limit the tree to `maxdepth = 2` (at most two levels of splits from the root, yielding up to 4 terminal nodes). This keeps the subgroup rules simple and interpretable, which is important for clinical communication.
 
 ```{r virtual-twins}
-# Step 1: Use T-Learner CATE as the "virtual twin" difference
-# (already computed above as cate_tlearner)
+# Step 1: Use X-Learner CATE as the "virtual twin" difference
+# (already computed above as cate_xlearner)
 
 # Step 2: Fit a regression tree on CATEs to identify subgroups
-vt_dat <- data.frame(X_covs, cate = cate_tlearner)
+vt_dat <- data.frame(X_covs, cate = cate_xlearner)
 
 vt_tree <- rpart(
   cate ~ ., data = vt_dat,
@@ -534,7 +534,7 @@ cat(paste(out, collapse = "\n"), "\n")
 ```{r vt-tree-plot, fig.height=6}
 rpart.plot(
   vt_tree, 
-  main = "Virtual Twins: Subgroup Tree from T-Learner CATEs",
+  main = "Virtual Twins: Subgroup Tree from X-Learner CATEs",
   extra = 101,  # show n and percent
   box.palette = "GnBu",
   shadow.col = "gray",
@@ -561,6 +561,98 @@ ggplot(dat, aes(x = vt_subgroup_label, y = trt_effect)) +
     panel.grid = element_blank(),
     axis.text.x = element_text(angle = 30, hjust = 1)
   )
+```
+
+
+## X-Learner CATE Estimates
+
+The following figure shows the X-Learner CATE estimates: estimated vs. true CATE (left) and a waterfall plot of the estimated CATEs ordered from smallest to largest (right). Patients are color-coded as "Benefitting" (estimated CATE > 0) or "Non-benefitting" (estimated CATE ≤ 0).
+
+```{r xlearner-cate-fig, fig.width=14, fig.height=6.2}
+# --- Build data ---
+xlearner_plot_df <- data.frame(
+  true_cate = true_cate,
+  estimated_cate = cate_xlearner,
+  benefit_group = ifelse(cate_xlearner > 0, "Benefitting", "Non-benefitting")
+)
+
+waterfall_df <- xlearner_plot_df %>%
+  arrange(estimated_cate) %>%
+  mutate(order = row_number())
+
+color_vals <- c("Benefitting" = "black", "Non-benefitting" = "grey70")
+shape_vals <- c("Benefitting" = 16, "Non-benefitting" = 1)
+
+# --- Left panel: Estimated vs True CATE ---
+p_scatter <- ggplot(xlearner_plot_df, aes(x = true_cate, y = estimated_cate,
+                                           color = benefit_group, shape = benefit_group)) +
+  geom_point(alpha = 0.55, size = 1.8, stroke = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "solid", color = "grey40", linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60", linewidth = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey60", linewidth = 0.5) +
+  scale_color_manual(values = color_vals) +
+  scale_shape_manual(values = shape_vals) +
+  labs(
+    title = "Estimated vs. True CATE",
+    x = "True CATE",
+    y = "Estimated CATE",
+    color = "Group", shape = "Group"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "top",
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 11)
+  )
+
+# --- Right panel: Waterfall plot ---
+p_waterfall <- ggplot(waterfall_df, aes(x = order, y = estimated_cate, fill = benefit_group)) +
+  geom_bar(stat = "identity", width = 1, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.5) +
+  scale_fill_manual(values = color_vals) +
+  labs(
+    title = "X-Learner CATE Waterfall",
+    x = "Individuals (ordered by estimated CATE)",
+    y = "Estimated CATE",
+    fill = "Group"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "top",
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 11)
+  )
+
+# --- Combine ---
+p_xlearner_fig52 <- p_scatter + p_waterfall +
+  plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "top")
+
+p_xlearner_fig52
+```
+
+```{r save-xlearner-fig52, include=FALSE}
+if (!dir.exists("figures")) dir.create("figures")
+ggsave(filename = "figures/Fig5.2.jpeg", plot = p_xlearner_fig52,
+       width = 14, height = 6.2, dpi = 300)
+```
+
+```{r save-vt-tree-fig, include=FALSE}
+# Save the Virtual Twins rpart tree as a standalone JPEG
+jpeg(filename = "figures/Fig5.3.jpeg", width = 8, height = 6, units = "in", res = 300)
+rpart.plot(
+  vt_tree,
+  main = "Virtual Twins: Subgroup Tree from X-Learner CATEs",
+  extra = 101,
+  box.palette = "GnBu",
+  shadow.col = "gray",
+  nn = TRUE
+)
+dev.off()
 ```
 
 
@@ -723,7 +815,7 @@ For practical implementation, it is often needed to classify which patients shou
 ```{r binary-subgroups}
 # --- Virtual Twins: classify leaves as B/NB based on mean predicted CATE ---
 vt_leaf <- as.character(vt_tree$where)
-vt_leaf_mean_cate <- tapply(cate_tlearner, vt_leaf, mean)
+vt_leaf_mean_cate <- tapply(cate_xlearner, vt_leaf, mean)
 vt_leaf_class <- ifelse(vt_leaf_mean_cate > 0, "B", "NB")
 dat$vt_binary <- vt_leaf_class[vt_leaf]
 
@@ -848,21 +940,34 @@ Having identified binary (Benefitting vs. Non-Benefitting) subgroups via Virtual
 # CATE Estimation Functions
 # ============================================================
 
-#' T-Learner CATE estimation
+#' X-Learner CATE estimation
 #' @param Y outcome vector
 #' @param Trt treatment indicator (0/1)
 #' @param X_mat numeric covariate matrix
 #' @param X_mat_pred covariate matrix for prediction (default: X_mat)
 #' @return vector of CATE estimates (one per row of X_mat_pred)
-estimate_cate_tlearner <- function(Y, Trt, X_mat, X_mat_pred = X_mat) {
+estimate_cate_xlearner <- function(Y, Trt, X_mat, X_mat_pred = X_mat) {
+  # Stage 1: fit separate outcome models
   dat_trt <- data.frame(X_mat[Trt == 1, , drop = FALSE], Y = Y[Trt == 1])
   dat_ctl <- data.frame(X_mat[Trt == 0, , drop = FALSE], Y = Y[Trt == 0])
   
   rf1 <- ranger(Y ~ ., data = dat_trt, num.trees = 500, min.node.size = 5)
   rf0 <- ranger(Y ~ ., data = dat_ctl, num.trees = 500, min.node.size = 5)
   
-  predict(rf1, data = data.frame(X_mat_pred))$predictions -
-    predict(rf0, data = data.frame(X_mat_pred))$predictions
+  # Stage 2: cross-arm imputation
+  D_treated <- Y[Trt == 1] - predict(rf0, data = data.frame(X_mat[Trt == 1, , drop = FALSE]))$predictions
+  D_control <- predict(rf1, data = data.frame(X_mat[Trt == 0, , drop = FALSE]))$predictions - Y[Trt == 0]
+  
+  rf_tau1 <- ranger(D ~ ., data = data.frame(X_mat[Trt == 1, , drop = FALSE], D = D_treated),
+                    num.trees = 500, min.node.size = 5)
+  rf_tau0 <- ranger(D ~ ., data = data.frame(X_mat[Trt == 0, , drop = FALSE], D = D_control),
+                    num.trees = 500, min.node.size = 5)
+  
+  # Stage 3: combine with propensity weighting (g=0.5 for 1:1 RCT)
+  tau_from_treated <- predict(rf_tau1, data = data.frame(X_mat_pred))$predictions
+  tau_from_control <- predict(rf_tau0, data = data.frame(X_mat_pred))$predictions
+  
+  0.5 * tau_from_control + 0.5 * tau_from_treated
 }
 
 # ============================================================
@@ -1011,7 +1116,7 @@ for (sg_method in c("Virtual Twins", "MOB", "Personalized")) {
 
 This approach uses bootstrap resampling (e.g. `boot::boot()`) to construct subgroup-specific CIs that account for the uncertainty in CATE estimation and subgroup identification. For each bootstrap resample:
 
-1. Re-estimate CATEs (T-Learner)
+1. Re-estimate CATEs (X-Learner)
 2. Re-run the subgroup identification model (VT, MOB, or Personalized)
 3. Re-classify into B/NB based on the new subgroup model
 4. Compute $E[Y \mid \text{Trt}=1, S=s] - E[Y \mid \text{Trt}=0, S=s]$ for each subgroup
@@ -1020,7 +1125,7 @@ This yields a bootstrap distribution of subgroup estimates. Following @foster201
 
 ```{r boot-statistic-functions}
 # Boot statistic functions for each subgroup method.
-# Each calls the reusable functions defined above (estimate_cate_tlearner,
+# Each calls the reusable functions defined above (estimate_cate_xlearner,
 # identify_subgroups_*, subgroup_effects_naive) to ensure consistent
 # tuning parameters between the original fit and bootstrap resamples.
 # Returns: c(effect_B, effect_NB)
@@ -1031,8 +1136,8 @@ boot_stat_vt <- function(data, indices) {
   X_mat_b <- as.matrix(d[, grep("^X", colnames(d))])
   X_covs_b <- d[, grep("^X", colnames(d)), drop = FALSE]
   
-  # Re-estimate CATEs
-  cate_b <- estimate_cate_tlearner(Y_b, Trt_b, X_mat_b)
+  # Re-estimate CATEs via X-Learner
+  cate_b <- estimate_cate_xlearner(Y_b, Trt_b, X_mat_b)
   
   # Re-identify subgroups
   sg_b <- identify_subgroups_vt(cate_b, X_covs_b)
@@ -1458,6 +1563,87 @@ ggplot(all_results, aes(y = y_label, x = estimate, color = subgroup_label)) +
     legend.position = "top",
     strip.text = element_text(face = "bold")
   )
+```
+
+## Virtual Twins Forest Plot
+
+```{r forest-plot-vt, fig.height=5, fig.width=10}
+# Filter to Virtual Twins only
+vt_results <- all_results %>%
+  filter(sg_method == "Virtual Twins")
+
+# Build dynamic caption with subgroup rules from the VT tree
+# Show NB rule explicitly, collapse all B leaves into one line
+vt_rules_text <- tryCatch({
+  rules <- rpart.rules(vt_tree, style = "tall", cover = TRUE)
+  leaf_ids <- rownames(rules)
+  
+  nb_lines <- character()
+  n_b_total <- 0
+  
+  for (i in seq_len(nrow(rules))) {
+    leaf_id_char <- as.character(which(rownames(vt_tree$frame) == leaf_ids[i]))
+    label <- vt_leaf_class[leaf_id_char]
+    n_leaf <- sum(vt_leaf == leaf_id_char)
+    rule_text <- paste(trimws(rules[i, ]), collapse = " ")
+    rule_text <- gsub(" when ", " ", rule_text)
+    # Strip the leading predicted CATE value (e.g. "-1.5072 X3..." -> "X3...")
+    rule_text <- sub("^-?[0-9]+\\.?[0-9]*\\s+", "", rule_text)
+    
+    if (label == "NB") {
+      nb_lines <- c(nb_lines, paste0("Non-benefitting: ", rule_text, " (n = ", n_leaf, ")"))
+    } else {
+      n_b_total <- n_b_total + n_leaf
+    }
+  }
+  
+  b_line <- paste0("Else, Benefitting (n = ", n_b_total, ")")
+  paste(c(nb_lines, b_line), collapse = "\n")
+}, error = function(e) {
+  "Subgroups defined by Virtual Twins regression tree on X-Learner CATEs."
+})
+
+caption_text <- paste0(
+  "\u25C6 = true subgroup ATE; colored points = estimate with 95% CI.\n",
+  "Subgroup rules:\n", vt_rules_text
+)
+
+method_order <- c("Naive", "Bootstrap (Refit)", "Debiased Bootstrap")
+vt_results <- vt_results %>%
+  mutate(y_label = factor(est_method, levels = rev(method_order)))
+
+p_vt_forest <- ggplot(vt_results, aes(y = y_label, x = estimate, color = subgroup_label)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.25) +
+  geom_point(aes(x = true_ate), shape = 18, size = 4, color = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+  scale_color_manual(values = c("Benefitting" = "#4DAF4A", "Non-Benefitting" = "#E41A1C")) +
+  labs(
+    title = "Virtual Twins: Subgroup Treatment Effect Estimates",
+    subtitle = expression(paste(
+      "\u25C6 = true subgroup ATE; colored points = estimate with 95% CI"
+    )),
+    x = "Treatment Effect", y = NULL,
+    color = "Subgroup",
+    caption = caption_text
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.caption = element_text(size = 8, hjust = 0, face = "italic"),
+    plot.caption.position = "plot"
+  )
+
+p_vt_forest
+```
+
+```{r save-vt-forest, include=FALSE}
+if (!dir.exists("figures")) dir.create("figures")
+ggsave(filename = "figures/Fig5.4.jpeg", plot = p_vt_forest,
+       width = 10, height = 5, dpi = 300)
 ```
 
 # Session Info
