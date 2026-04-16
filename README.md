@@ -1,6 +1,6 @@
 # Chapter 5, Heterogeneous Treatment Effects
 
-R code and walkthrough for a Heterogeneous Treatment Effects analysis chapter. The main file is `Walkthrough of Heterogeneous Treatment Effects Analysis.Rmd`.
+R code and walkthrough for a Heterogeneous Treatment Effects analysis chapter. The main file is [`code/Walkthrough of Heterogeneous Treatment Effects Analysis.Rmd`](code/Walkthrough%20of%20Heterogeneous%20Treatment%20Effects%20Analysis.Rmd).
 
 ## Overview
 
@@ -18,4 +18,4 @@ Demonstrates a complete workflow for identifying and estimating heterogeneous tr
 
 ## Output
 
-A rendered HTML walkthrough is included: `Walkthrough-of-Heterogeneous-Treatment-Effects-Analysis.html`
+A rendered HTML walkthrough is included: [`code/Walkthrough-of-Heterogeneous-Treatment-Effects-Analysis.html`](code/Walkthrough-of-Heterogeneous-Treatment-Effects-Analysis.html)
