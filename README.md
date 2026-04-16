@@ -1,4 +1,4 @@
-# chapman_hall_treatment_heterogeneity
+# Chapter 5, Heterogeneous Treatment Effects
 
 R code and walkthrough for a Heterogeneous Treatment Effects analysis chapter. The main file is `Walkthrough of Heterogeneous Treatment Effects Analysis.Rmd`.
 
